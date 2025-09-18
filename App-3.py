@@ -5,6 +5,8 @@ import streamlit as st
 import numpy as np
 from itertools import combinations
 from scipy.stats import chi2_contingency, binomtest
+from io import BytesIO
+import plotly.graph_objects as go
 
 # =========================
 # --- BACKEND FUNCTIONS ---
@@ -58,8 +60,6 @@ def create_abnormality_grouped_bar_chart_optimized(df: pd.DataFrame, metrics: li
     """
     abnormal_cols = [f'Abnormal {metric}' for metric in metrics]
     
-    # Create a unique signature for each row's combination of abnormalities
-    # This is much faster than iterating through every possible combination
     def create_signature(row):
         present = [metric for i, metric in enumerate(metrics) if row.iloc[i] == 1]
         return " ∩ ".join(present) if present else "All Normal"
@@ -67,13 +67,11 @@ def create_abnormality_grouped_bar_chart_optimized(df: pd.DataFrame, metrics: li
     combo_signatures = df[abnormal_cols].apply(create_signature, axis=1)
     combo_counts = combo_signatures.value_counts()
     
-    # Filter out "All Normal" and take the top combinations
     combo_counts = combo_counts[combo_counts.index != 'All Normal'].head(30)
     
     plot_df = combo_counts.reset_index()
     plot_df.columns = ['Metric Combination', 'Count']
     
-    # Plotting
     fig, ax = plt.subplots(figsize=(16, 8))
     bars = sns.barplot(x='Count', y='Metric Combination', data=plot_df.sort_values('Count', ascending=True), ax=ax, palette='viridis', orient='h')
     ax.set_xlabel('Number of Individuals')
@@ -91,30 +89,22 @@ def create_abnormality_grouped_bar_chart_optimized(df: pd.DataFrame, metrics: li
 def plot_correlation_heatmap_optimized(df: pd.DataFrame, title="Correlation Between Abnormal Metrics") -> plt.Figure:
     """
     Generates a bar chart of pairwise correlations to avoid heatmap layout issues.
-    This provides a clear, sorted view of the relationships between metrics.
     """
     corr = df.corr()
-    # Unstack the matrix to get a series of all pairs
     corr_pairs = corr.unstack().sort_values(kind="quicksort")
-    # Remove self-correlations (where the value is 1.0)
     corr_pairs = corr_pairs[corr_pairs != 1.0]
     
-    # Create a unique key for each pair to remove duplicates (e.g., (A,B) and (B,A))
     corr_pairs = corr_pairs.reset_index()
     corr_pairs.columns = ['Metric 1', 'Metric 2', 'Correlation']
     corr_pairs['pair_key'] = corr_pairs.apply(lambda row: tuple(sorted((row['Metric 1'], row['Metric 2']))), axis=1)
     
-    # Drop duplicates and create nice labels for the plot
     corr_pairs = corr_pairs.drop_duplicates(subset='pair_key').set_index('pair_key')
     corr_pairs['Pair Label'] = corr_pairs.apply(lambda row: f"{row['Metric 1'].replace('Abnormal ', '')} × {row['Metric 2'].replace('Abnormal ', '')}", axis=1)
     
-    # Sort by correlation strength for a clean visual
     corr_pairs = corr_pairs.sort_values('Correlation', ascending=True)
 
-    # Create the plot
     fig, ax = plt.subplots(figsize=(10, 8), layout='constrained')
     
-    # Use different colors for positive and negative correlations
     colors = ['#d6604d' if c < 0 else '#4393c3' for c in corr_pairs['Correlation']]
     
     bars = ax.barh(corr_pairs['Pair Label'], corr_pairs['Correlation'], color=colors)
@@ -122,59 +112,75 @@ def plot_correlation_heatmap_optimized(df: pd.DataFrame, title="Correlation Betw
     ax.set_title(title, fontsize=14, fontweight='bold')
     ax.set_xlabel('Pearson Correlation')
     ax.set_ylabel('Metric Pair')
-    ax.axvline(0, color='grey', linewidth=0.8, linestyle='--') # Add a zero line for reference
+    ax.axvline(0, color='grey', linewidth=0.8, linestyle='--')
     
-    # Add data labels to the end of each bar
     for bar in bars:
         width = bar.get_width()
         label_x_pos = width + 0.01 if width > 0 else width - 0.01
         ax.text(label_x_pos, bar.get_y() + bar.get_height()/2, f'{width:.2f}', 
                 va='center', ha='left' if width > 0 else 'right')
 
-    ax.margins(x=0.15) # Add some padding
+    ax.margins(x=0.15)
     return fig
 
+# === NEW HEATMAP FUNCTION USING PLOTLY ===
 def create_cooccurrence_heatmap(pairwise_results):
     """
-    Creates a heatmap of the difference between observed and expected frequencies.
-    This robust version correctly handles NaN values by not plotting text for them
-    and includes rotated labels for better visibility.
+    Creates an interactive heatmap using Plotly to bypass Matplotlib/Seaborn
+    rendering issues. This version guarantees text visibility and formats to 2 decimal places.
     """
+    if not pairwise_results or not isinstance(next(iter(pairwise_results.values())), dict):
+        fig = go.Figure()
+        fig.update_layout(
+            xaxis_showgrid=False, yaxis_showgrid=False,
+            xaxis_visible=False, yaxis_visible=False,
+            annotations=[dict(text="Not enough data for heatmap", x=0.5, y=0.5, showarrow=False, font_size=20)]
+        )
+        return fig
+    
     pairs = list(pairwise_results.keys())
-    combinations_list = list(next(iter(pairwise_results.values()))['combinations'].keys())
-    diff_matrix = np.array([[res['combinations'][combo]['difference'] for combo in combinations_list] for res in pairwise_results.values()])
+    combinations_list = [c.replace(' ', '\n') for c in next(iter(pairwise_results.values()))['combinations'].keys()]
+    pct_diff_data = []
     
-    fig, ax = plt.subplots(figsize=(14, 10))
-    # np.nanmax safely ignores nan values when finding the maximum
-    max_abs_diff = np.nanmax(np.abs(diff_matrix))
-    if not np.isfinite(max_abs_diff) or max_abs_diff == 0:
-        max_abs_diff = 1  # Set a default if all values are NaN or zero
-
-    im = ax.imshow(diff_matrix, cmap='RdBu_r', aspect='auto', vmin=-max_abs_diff, vmax=max_abs_diff)
-    ax.set_xticks(range(len(combinations_list)))
-    ax.set_yticks(range(len(pairs)))
+    for res in pairwise_results.values():
+        row = []
+        for combo in res['combinations'].keys():
+            stats = res['combinations'].get(combo, {})
+            difference = stats.get('difference', np.nan)
+            expected = stats.get('expected', np.nan)
+            if expected > 0 and np.isfinite(difference):
+                pct_diff = (difference / expected) * 100
+            else:
+                pct_diff = np.nan
+            row.append(pct_diff)
+        pct_diff_data.append(row)
     
-    ax.set_xticklabels([combo.replace(' ', '\n') for combo in combinations_list], fontsize=10, rotation=45, ha='right')
-    ax.set_yticklabels(pairs, fontsize=11)
+    plot_df = pd.DataFrame(pct_diff_data, index=pairs, columns=combinations_list)
     
-    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label('Difference from Expected\n(Red=More than chance, Blue=Less than chance)', rotation=270, labelpad=25, fontsize=12)
+    # Round the values to 2 decimal places for consistent display
+    plot_df_rounded = plot_df.round(2)
     
-    # Robust text annotation loop: checks for valid numbers before drawing them.
-    for i in range(len(pairs)):
-        for j in range(len(combinations_list)):
-            value = diff_matrix[i, j]
-            # Only proceed if the value is a finite number (not NaN or infinity)
-            if np.isfinite(value):
-                # Determine text color based on the background cell color for readability
-                color = 'white' if abs(value) > max_abs_diff * 0.5 else 'black'
-                # Add the text to the cell
-                ax.text(j, i, f'{value:.1f}', ha='center', va='center', color=color, fontweight='bold', fontsize=9)
+    fig = go.Figure(data=go.Heatmap(
+        z=plot_df_rounded.values,
+        x=plot_df_rounded.columns,
+        y=plot_df_rounded.index,
+        colorscale='RdBu',
+        zmid=0,
+        text=plot_df_rounded.values,
+        # Format text to show exactly 2 decimal places with sign
+        texttemplate="%{z:+.2f}%",
+        textfont={"size": 10}
+    ))
     
-    ax.set_title('Co-occurrence Analysis: Deviations from Chance Expectations', fontsize=14, fontweight='bold', pad=20)
-    ax.set_xlabel('Combination Type', fontsize=12)
-    ax.set_ylabel('Metric Pairs', fontsize=12)
-    plt.tight_layout(pad=1.5)
+    fig.update_layout(
+        title_text='Co-occurrence Analysis: Percentage Deviations from Chance',
+        title_x=0.5,
+        xaxis_title='Combination Type',
+        yaxis_title='Metric Pairs',
+        yaxis_autorange='reversed',
+        height=700,
+        margin=dict(l=250, r=50, t=100, b=50)
+    )
     
     return fig
 
@@ -202,9 +208,9 @@ def create_detailed_cooccurrence_table(pairwise_results):
                 'Metric Pair': pair_name,
                 'Combination': combo_name,
                 'Observed': int(stats['observed']),
-                'Expected': f"{expected:.1f}",
-                'Difference': f"{difference:+.1f}",
-                'Percent Difference': f"{pct_diff:+.1f}%",
+                'Expected': f"{expected:.2f}",
+                'Difference': f"{difference:+.2f}",
+                'Percent Difference': f"{pct_diff:+.2f}%",
                 'Direction': 'More than chance' if difference > 0 else 'Less than chance' if difference < 0 else 'As expected'
             })
     return pd.DataFrame(detailed_data)
@@ -293,10 +299,8 @@ def analyze_health_data(df):
     
     df['abnormality_count'] = df[abnormality_cols].sum(axis=1)
     abnormality_count_table = df['abnormality_count'].value_counts().sort_index()
-    combo_counts = df[abnormality_cols].value_counts()
-    normal_combo_counts = df[normal_cols].value_counts()
     
-    return abnormality_count_table, combo_counts, normal_combo_counts, df[abnormality_cols], df
+    return abnormality_count_table, df[abnormality_cols], df
 
 def plot_metric_distribution(df, value_col, metric_name, unit, lb=None, ub=None):
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -351,14 +355,13 @@ def render_dietary_section(df: pd.DataFrame, comparison_df: pd.DataFrame = None)
 
     st.markdown(f"**Sample Size**: {len(df)} individuals")
     
-    # Helper function to add labels to bars
     def _autolabel_bars(rects, ax_obj):
         for rect in rects:
             height = rect.get_height()
             if height > 0:
-                ax_obj.annotate(f'{height:.1f}%',
+                ax_obj.annotate(f'{height:.2f}%',
                                 xy=(rect.get_x() + rect.get_width() / 2, height),
-                                xytext=(0, 3),  # 3 points vertical offset
+                                xytext=(0, 3),
                                 textcoords="offset points",
                                 ha='center', va='bottom', fontsize=8)
 
@@ -380,7 +383,7 @@ def render_dietary_section(df: pd.DataFrame, comparison_df: pd.DataFrame = None)
                     try:
                         chi2, p, dof, ex = chi2_contingency(contingency_table)
                         p_value_text = f" (p={p:.3f})"
-                        if p < 0.05: p_value_text += " *"  # Use asterisk for significance
+                        if p < 0.05: p_value_text += " *"
                     except ValueError:
                         p_value_text = " (p=N/A)"
 
@@ -418,6 +421,7 @@ def main():
     st.markdown("Upload your raw NFHS-5 CSV to analyze health metrics, co-occurrence patterns, and dietary habits.")
     
     st.sidebar.header("Health Thresholds")
+    # Sidebar inputs remain the same...
     bmi_lb = st.sidebar.number_input("BMI Lower Bound (kg/m²)", value=18.5)
     bmi_ub = st.sidebar.number_input("BMI Upper Bound (kg/m²)", value=23)
     press_lb = st.sidebar.number_input("Systolic Pressure Lower Bound (mmHg)", value=90.0)
@@ -428,6 +432,7 @@ def main():
     glu_ub = st.sidebar.number_input("Glucose Upper Bound (mg/dL)", value=200.0)
     wai_lb = st.sidebar.number_input("Waist Lower Bound (cm)", value=70.0)
     wai_ub = st.sidebar.number_input("Waist Upper Bound (cm)", value=90.0)
+    
     
     with st.expander("Expected Data Format"):
         st.markdown("""
@@ -454,20 +459,19 @@ def main():
                 
                 st.success("Health indicators created successfully!")
                 
-                abnormality_count_table, combo_counts, normal_combo_counts, ab_df, processed_df = analyze_health_data(df)
+                abnormality_count_table, ab_df, processed_df = analyze_health_data(df)
                 
                 main_tab1, main_tab2 = st.tabs(["Health Profile Analysis", "Dietary Pattern Analysis"])
 
                 with main_tab1:
                     with st.expander("Processed Data Summary", expanded=True):
                         col1, col2, col3, col4, col5 = st.columns(5)
-                        col1.metric("Normal BMI", f"{processed_df['Normal bmi'].sum()}/{len(processed_df)}", f"{processed_df['Normal bmi'].mean()*100:.1f}%")
-                        col2.metric("Normal BP", f"{processed_df['Normal systolic pressure'].sum()}/{len(processed_df)}", f"{processed_df['Normal systolic pressure'].mean()*100:.1f}%")
-                        col3.metric("Normal Hb", f"{processed_df['Normal haemoglobin'].sum()}/{len(processed_df)}", f"{processed_df['Normal haemoglobin'].mean()*100:.1f}%")
-                        col4.metric("Normal Glucose", f"{processed_df['Normal glucose'].sum()}/{len(processed_df)}", f"{processed_df['Normal glucose'].mean()*100:.1f}%")
-                        col5.metric("Normal Waist", f"{processed_df['Normal waist'].sum()}/{len(processed_df)}", f"{processed_df['Normal waist'].mean()*100:.1f}%")
+                        col1.metric("Normal BMI", f"{processed_df['Normal bmi'].sum()}/{len(processed_df)}", f"{processed_df['Normal bmi'].mean()*100:.2f}%")
+                        col2.metric("Normal BP", f"{processed_df['Normal systolic pressure'].sum()}/{len(processed_df)}", f"{processed_df['Normal systolic pressure'].mean()*100:.2f}%")
+                        col3.metric("Normal Hb", f"{processed_df['Normal haemoglobin'].sum()}/{len(processed_df)}", f"{processed_df['Normal haemoglobin'].mean()*100:.2f}%")
+                        col4.metric("Normal Glucose", f"{processed_df['Normal glucose'].sum()}/{len(processed_df)}", f"{processed_df['Normal glucose'].mean()*100:.2f}%")
+                        col5.metric("Normal Waist", f"{processed_df['Normal waist'].sum()}/{len(processed_df)}", f"{processed_df['Normal waist'].mean()*100:.2f}%")
 
-                    # --- DETAILED METRIC ANALYSIS ---
                     st.header("Detailed Metric Analysis")
                     metrics_to_plot = [
                         {'value_col': 'BMI_value', 'normal_col': 'bmi', 'name': 'BMI', 'unit': 'kg/m²', 'lb': bmi_lb, 'ub': bmi_ub},
@@ -476,7 +480,6 @@ def main():
                         {'value_col': 'Glucose_value', 'normal_col': 'glucose', 'name': 'Glucose', 'unit': 'mg/dL', 'lb': glu_lb, 'ub': glu_ub},
                         {'value_col': 'Waist_value', 'normal_col': 'waist', 'name': 'Waist Circumference', 'unit': 'cm', 'lb': wai_lb, 'ub': wai_ub}
                     ]
-
                     for metric in metrics_to_plot:
                         with st.container(border=True):
                             st.subheader(f"{metric['name']} Analysis")
@@ -492,16 +495,10 @@ def main():
                                 abnormal_count = processed_df[abnormal_col_name].sum()
                                 total_count = len(processed_df)
                                 abnormal_pct = (abnormal_count / total_count) * 100 if total_count > 0 else 0
-                                
                                 st.metric(label=f"Mean {metric['name']}", value=f"{data.mean():.2f} {metric['unit']}" if not data.empty else "N/A")
                                 st.metric(label=f"Median {metric['name']}", value=f"{data.median():.2f} {metric['unit']}" if not data.empty else "N/A")
-                                st.metric(
-                                    label="Abnormal Count", 
-                                    value=f"{abnormal_count} / {total_count}",
-                                    help=f"{abnormal_pct:.1f}% of individuals fall outside the normal range."
-                                )
-                    
-                    # --- NEWLY ADDED SUMMARY TABLE ---
+                                st.metric(label="Abnormal Count", value=f"{abnormal_count} / {total_count}", help=f"{abnormal_pct:.2f}% of individuals fall outside the normal range.")
+
                     st.subheader("Normality Status by Metric")
                     summary_data = []
                     total_individuals = len(processed_df)
@@ -515,40 +512,34 @@ def main():
                     for metric in metric_details:
                         normal_col = f"Normal {metric['id']}"
                         abnormal_col = f"Abnormal {metric['id']}"
-                        
                         normal_count = int(processed_df[normal_col].sum())
                         abnormal_count = int(processed_df[abnormal_col].sum())
-                        
                         summary_data.append({
-                            'Metric': metric['name'],
-                            'Normal Count': normal_count,
-                            'Abnormal Count': abnormal_count,
-                            'Total': total_individuals,
-                            '% Normal': (normal_count / total_individuals) * 100 if total_individuals > 0 else 0,
+                            'Metric': metric['name'], 'Normal Count': normal_count, 'Abnormal Count': abnormal_count,
+                            'Total': total_individuals, '% Normal': (normal_count / total_individuals) * 100 if total_individuals > 0 else 0,
                             '% Abnormal': (abnormal_count / total_individuals) * 100 if total_individuals > 0 else 0
                         })
                     summary_df = pd.DataFrame(summary_data).set_index('Metric')
                     st.dataframe(summary_df.style.format({
-                        '% Normal': '{:.1f}%',
-                        '% Abnormal': '{:.1f}%'
+                        '% Normal': '{:.2f}%', '% Abnormal': '{:.2f}%'
                     }).background_gradient(cmap='RdYlGn', subset=['% Normal'], vmin=0, vmax=100)
                       .background_gradient(cmap='RdYlGn_r', subset=['% Abnormal'], vmin=0, vmax=100),
                       use_container_width=True)
-
+                    
                     st.header("Overall Health Distribution")
                     col1, col2 = st.columns(2)
                     with col1:
                         st.subheader("Abnormality Count Distribution")
+                        abnormality_count_df = abnormality_count_table.to_frame(name="Count")
                         fig1, ax1 = plt.subplots(figsize=(8, 6))
-                        abnormality_count_table.plot(kind="bar", ax=ax1, color="skyblue")
+                        abnormality_count_df.plot(kind="bar", ax=ax1, color="skyblue", legend=False)
                         ax1.set_title("Distribution of Total Abnormalities per Person")
                         ax1.set_xlabel("Number of Abnormalities")
                         ax1.set_ylabel("Number of Individuals")
                         plt.xticks(rotation=0)
                         st.pyplot(fig1)
                         plt.close(fig1)
-                        st.dataframe(abnormality_count_table.to_frame(name="Count"))
-                    
+                        st.dataframe(abnormality_count_df)
                     with col2:
                         st.subheader("Correlation Between Abnormal Metrics")
                         fig2 = plot_correlation_heatmap_optimized(ab_df)
@@ -576,31 +567,30 @@ def main():
                     
                     st.subheader("Deviations Heatmap")
                     fig_cooccurrence = create_cooccurrence_heatmap(pairwise_results)
-                    st.pyplot(fig_cooccurrence)
-                    plt.close(fig_cooccurrence)
+                    st.plotly_chart(fig_cooccurrence, use_container_width=True)
                     
                     st.subheader("Top Exclusive Co-occurring Abnormality Combinations (More than Chance)")
                     cooccurrence_df = analyze_all_combinations_cooccurrence(processed_df, abnormal_cols)
                     if not cooccurrence_df.empty:
-                        df_to_display = cooccurrence_df.head(10).copy()
-                        df_to_display['Expected Count'] = df_to_display['Expected Count'].map('{:.2f}'.format)
-                        df_to_display['Difference'] = df_to_display['Difference'].map('{:+.2f}'.format)
-                        st.dataframe(df_to_display.set_index('Abnormality Combination').style.format({'P-value': "{:.4f}"}))
+                        cooccurrence_df_display = cooccurrence_df.head(10).copy()
+                        cooccurrence_df_display['Expected Count'] = cooccurrence_df_display['Expected Count'].map('{:.2f}'.format)
+                        cooccurrence_df_display['Difference'] = cooccurrence_df_display['Difference'].map('{:+.2f}'.format)
+                        st.dataframe(cooccurrence_df_display.set_index('Abnormality Combination').style.format({'P-value': "{:.4f}"}))
                     else:
                         st.info("No exclusive combinations found to co-occur significantly more than chance.")
-                    
+                
                 with main_tab2:
                     st.header("Dietary Pattern Analysis")
                     abnormal_cols = ['Abnormal bmi', 'Abnormal systolic pressure', 'Abnormal glucose', 'Abnormal haemoglobin', 'Abnormal waist']
                     metric_ids = ['bmi', 'systolic pressure', 'glucose', 'haemoglobin', 'waist']
-                    cooccurrence_df = analyze_all_combinations_cooccurrence(processed_df, abnormal_cols)
+                    cooccurrence_df_diet = analyze_all_combinations_cooccurrence(processed_df, abnormal_cols)
                     
                     diet_tab1, diet_tab2, diet_tab3 = st.tabs(["Top Abnormality Groups", "All Participants", "Interactive Explorer"])
                     
                     with diet_tab1:
                         st.subheader("Comparing Top 10 Co-Abnormality Groups")
                         st.info("Dietary profiles for the top groups found to co-occur more than chance. Charts compare the group's diet to the overall population. An asterisk (*) in the title indicates a statistically significant difference (p<0.05).")
-                        top10 = cooccurrence_df.head(10)
+                        top10 = cooccurrence_df_diet.head(10)
                         
                         if not top10.empty:
                             for i, row in top10.iterrows():
@@ -630,7 +620,7 @@ def main():
                         st.subheader("Build Your Own Analysis Group")
                         st.markdown("Select one or more abnormalities to see the dietary habits for individuals who have **exactly** that combination and no others.")
                         
-                        selected_metrics = st.multiselect(
+                        selected_metrics = st.multoselect(
                             "Select abnormalities for your group:", 
                             options=metric_ids, 
                             default=[]
@@ -652,7 +642,8 @@ def main():
                                 st.warning("No individuals found with this exact combination of abnormalities.")
 
         except Exception as e:
-            st.error(f"Error processing file: {str(e)}")
+            st.error(f"Error processing file: {e}")
+            st.error("Please ensure your CSV file contains the required columns and is formatted correctly.")
     
     else:
         st.info("Please upload a CSV file to begin analysis")
